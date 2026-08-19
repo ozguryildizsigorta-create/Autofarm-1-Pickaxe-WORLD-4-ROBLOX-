@@ -1,0 +1,690 @@
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+
+-- Genel Kontrol Değişkenleri ve Koordinatlar
+local isRunning = true
+local autoFarmActive = false
+
+local LOBBY_POS = Vector3.new(0, -67, -39)
+local MAP_TARGET_POS = Vector3.new(28, 219, 9096)
+
+-- 1. Rol Doğrulama Fonksiyonu
+local function getRole(player)
+    local char = player.Character
+    local backpack = player:FindFirstChild("Backpack")
+
+    local function checkContainer(container)
+        if not container then return nil end
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") then
+                local name = string.lower(item.Name)
+                if name == "knife" or name == "bıçak" or name == "bicak" or name == "blade" then
+                    return "Katil"
+                elseif name == "gun" or name == "revolver" or name == "silah" or name == "luger" or name == "sheriff" then
+                    return "Şerif"
+                end
+            end
+        end
+        return nil
+    end
+
+    local foundRole = checkContainer(char) or checkContainer(backpack)
+    if foundRole == "Katil" then
+        return "Katil", Color3.fromRGB(235, 60, 60), Color3.fromRGB(60, 20, 20)
+    elseif foundRole == "Şerif" then
+        return "Şerif", Color3.fromRGB(60, 150, 255), Color3.fromRGB(20, 35, 60)
+    else
+        return "Masum", Color3.fromRGB(60, 220, 100), Color3.fromRGB(20, 50, 35)
+    end
+end
+
+-- 2. Çantadaki/Eldeki Silahı Otomatik Kuşanma (Equip) Fonksiyonu
+local function autoEquipWeapon(player, weaponType)
+    local char = player.Character
+    local backpack = player:FindFirstChild("Backpack")
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    if not char or not humanoid or humanoid.Health <= 0 then return nil end
+
+    -- Zaten elde takılı mı kontrol et
+    for _, item in ipairs(char:GetChildren()) do
+        if item:IsA("Tool") then
+            local name = string.lower(item.Name)
+            if weaponType == "Knife" and (name:find("knife") or name:find("bicak") or name:find("bıçak") or name:find("blade")) then
+                return item
+            elseif weaponType == "Gun" and (name:find("gun") or name:find("revolver") or name:find("silah") or name:find("sheriff")) then
+                return item
+            end
+        end
+    end
+
+    -- Çantada ise karaktere tak (Equip)
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item:IsA("Tool") then
+                local name = string.lower(item.Name)
+                if weaponType == "Knife" and (name:find("knife") or name:find("bicak") or name:find("bıçak") or name:find("blade")) then
+                    humanoid:EquipTool(item)
+                    task.wait(0.1)
+                    return item
+                elseif weaponType == "Gun" and (name:find("gun") or name:find("revolver") or name:find("silah") or name:find("sheriff")) then
+                    humanoid:EquipTool(item)
+                    task.wait(0.1)
+                    return item
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+-- 3. Haritada Düşen Silahı Bulma
+local function getDroppedGunPart()
+    for _, item in ipairs(Workspace:GetChildren()) do
+        local lName = string.lower(item.Name)
+        if lName == "gundrop" or (item:IsA("Tool") and (lName == "gun" or lName == "revolver")) then
+            local part = item:IsA("BasePart") and item or item:FindFirstChildWhichIsA("BasePart")
+            if part then return part end
+        end
+    end
+    return nil
+end
+
+-- 4. En Yakın Zemin Üstü Pozisyonu Hesaplama
+local function getHighestSurfaceCFrame(targetPos)
+    local nearestPart = nil
+    local minDistance = math.huge
+
+    for _, obj in ipairs(Workspace:GetChildren()) do
+        if obj:IsA("BasePart") then
+            local dist = (obj.Position - targetPos).Magnitude
+            if dist < minDistance then
+                minDistance = dist
+                nearestPart = obj
+            end
+        elseif obj:IsA("Model") then
+            local primary = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+            if primary then
+                local dist = (primary.Position - targetPos).Magnitude
+                if dist < minDistance then
+                    minDistance = dist
+                    nearestPart = primary
+                end
+            end
+        end
+    end
+
+    if nearestPart then
+        local topY = nearestPart.Position.Y + (nearestPart.Size.Y / 2) + 3.5
+        return CFrame.new(nearestPart.Position.X, topY, nearestPart.Position.Z)
+    end
+
+    return CFrame.new(targetPos + Vector3.new(0, 4, 0))
+end
+
+-- 5. Haritadaki Aktif Coinleri Bulma
+local function getActiveCoins()
+    local coins = {}
+    for _, model in ipairs(Workspace:GetChildren()) do
+        if model:IsA("Model") or model:IsA("Folder") then
+            local coinFolder = model:FindFirstChild("CoinContainer") or model:FindFirstChild("CoinServer") or model:FindFirstChild("Coins")
+            if coinFolder then
+                for _, c in ipairs(coinFolder:GetChildren()) do
+                    if c:IsA("BasePart") then table.insert(coins, c) end
+                end
+            else
+                for _, part in ipairs(model:GetChildren()) do
+                    local lName = string.lower(part.Name)
+                    if part:IsA("BasePart") and (lName:find("coin") or lName == "coin_server") then
+                        table.insert(coins, part)
+                    end
+                end
+            end
+        elseif model:IsA("BasePart") then
+            local lName = string.lower(model.Name)
+            if lName == "coin" or lName == "coin_server" then
+                table.insert(coins, model)
+            end
+        end
+    end
+    return coins
+end
+
+-- 6. Katil Yeteneği: Bıçağı Çıkarıp Sırayla Herkesi Öldürme ve Geri Dönüş
+local function teleportAndEliminateAll(killerPlayer)
+    if getRole(killerPlayer) ~= "Katil" then return end
+
+    local killerChar = killerPlayer.Character
+    if not killerChar or not killerChar:FindFirstChild("HumanoidRootPart") then return end
+
+    local killerHum = killerChar:FindFirstChild("Humanoid")
+    local killerRoot = killerChar.HumanoidRootPart
+    local originalCFrame = killerRoot.CFrame
+
+    -- Bıçağı ele al
+    local knife = autoEquipWeapon(killerPlayer, "Knife")
+
+    for _, target in ipairs(Players:GetPlayers()) do
+        if target ~= killerPlayer and killerHum and killerHum.Health > 0 then
+            local targetChar = target.Character
+            local targetHum = targetChar and targetChar:FindFirstChild("Humanoid")
+            local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+
+            if targetHum and targetHum.Health > 0 and targetRoot then
+                -- Hedefin arkasına ışınlan
+                killerRoot.CFrame = targetRoot.CFrame * CFrame.new(0, 0, 2)
+                
+                -- Bıçağı salla / tetikle
+                if knife then
+                    knife:Activate()
+                end
+                targetHum:TakeDamage(100) -- Tam hasar ver
+                
+                task.wait(0.2)
+            end
+        end
+    end
+
+    -- Başlangıç konumuna geri dön
+    if killerChar and killerRoot and killerHum and killerHum.Health > 0 then
+        task.wait(0.1)
+        killerRoot.CFrame = originalCFrame
+    end
+end
+
+-- 7. Şerif Yeteneği: Silahı Ele Alıp Katili Vurma ve Geri Dönüş
+local function teleportAndShootMurderer(sheriffPlayer)
+    if getRole(sheriffPlayer) ~= "Şerif" then return end
+
+    local sheriffChar = sheriffPlayer.Character
+    if not sheriffChar or not sheriffChar:FindFirstChild("HumanoidRootPart") then return end
+
+    local sheriffHum = sheriffChar:FindFirstChild("Humanoid")
+    local sheriffRoot = sheriffChar.HumanoidRootPart
+    local originalCFrame = sheriffRoot.CFrame
+
+    -- Silahı ele al
+    local gun = autoEquipWeapon(sheriffPlayer, "Gun")
+
+    for _, target in ipairs(Players:GetPlayers()) do
+        if target ~= sheriffPlayer and getRole(target) == "Katil" then
+            local targetChar = target.Character
+            local targetHum = targetChar and targetChar:FindFirstChild("Humanoid")
+            local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+
+            if targetHum and targetHum.Health > 0 and targetRoot and sheriffHum and sheriffHum.Health > 0 then
+                -- Katilin arkasına ışınlanıp nişan al
+                sheriffRoot.CFrame = targetRoot.CFrame * CFrame.new(0, 0, 3)
+                
+                -- Silahı ateşle / tetikle
+                if gun then
+                    gun:Activate()
+                end
+                targetHum:TakeDamage(100) -- Katili ele
+                
+                task.wait(0.2)
+
+                -- Başlangıç konumuna geri dön
+                if sheriffChar and sheriffRoot and sheriffHum and sheriffHum.Health > 0 then
+                    task.wait(0.1)
+                    sheriffRoot.CFrame = originalCFrame
+                end
+                break
+            end
+        end
+    end
+end
+
+-- 8. Düşen Silaha Işınlanıp Alıp Geri Dönme Fonksiyonu
+local function teleportAndGrabGun(player)
+    local char = player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+    
+    local root = char.HumanoidRootPart
+    local hum = char:FindFirstChild("Humanoid")
+    if not hum or hum.Health <= 0 then return end
+
+    local gunPart = getDroppedGunPart()
+    if gunPart then
+        local originalCFrame = root.CFrame
+        root.CFrame = gunPart.CFrame
+        task.wait(0.25)
+
+        if char and root and hum and hum.Health > 0 then
+            root.CFrame = originalCFrame
+        end
+    end
+end
+
+-- 9. Panel Arayüzü Oluşturucu
+local function buildGui(player)
+    local pGui = player:WaitForChild("PlayerGui")
+    if pGui:FindFirstChild("MM2ActionPanelGUI") then pGui.MM2ActionPanelGUI:Destroy() end
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "MM2ActionPanelGUI"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = pGui
+
+    local frame = Instance.new("Frame")
+    frame.Name = "Panel"
+    frame.Size = UDim2.new(0, 240, 0, 495)
+    frame.Position = UDim2.new(0, 20, 0.5, -247)
+    frame.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Draggable = true
+    frame.Parent = screenGui
+
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+    local stroke = Instance.new("UIStroke", frame)
+    stroke.Color = Color3.fromRGB(50, 55, 65)
+
+    -- Başlık & İmha Butonu
+    local header = Instance.new("Frame", frame)
+    header.Size = UDim2.new(1, 0, 0, 36)
+    header.BackgroundColor3 = Color3.fromRGB(28, 32, 40)
+    header.BorderSizePixel = 0
+    Instance.new("UICorner", header).CornerRadius = UDim.new(0, 8)
+
+    local title = Instance.new("TextLabel", header)
+    title.Size = UDim2.new(0.55, 0, 1, 0)
+    title.Position = UDim2.new(0, 10, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "MM2 PANEL"
+    title.TextColor3 = Color3.fromRGB(240, 240, 245)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 12
+    title.TextXAlignment = Enum.TextXAlignment.Left
+
+    local destroyBtn = Instance.new("TextButton", header)
+    destroyBtn.Size = UDim2.new(0, 65, 0, 22)
+    destroyBtn.Position = UDim2.new(1, -72, 0.5, -11)
+    destroyBtn.BackgroundColor3 = Color3.fromRGB(190, 45, 45)
+    destroyBtn.Text = "İmha Et"
+    destroyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    destroyBtn.Font = Enum.Font.GothamBold
+    destroyBtn.TextSize = 10
+    Instance.new("UICorner", destroyBtn).CornerRadius = UDim.new(0, 4)
+
+    destroyBtn.MouseButton1Click:Connect(function()
+        isRunning = false
+        autoFarmActive = false
+        for _, p in ipairs(Players:GetPlayers()) do
+            local g = p:FindFirstChild("PlayerGui") and p.PlayerGui:FindFirstChild("MM2ActionPanelGUI")
+            if g then g:Destroy() end
+            if p.Character and p.Character:FindFirstChild("RoleESP") then
+                p.Character.RoleESP:Destroy()
+            end
+        end
+        for _, item in ipairs(Workspace:GetChildren()) do
+            if item:FindFirstChild("GunESP") then item.GunESP:Destroy() end
+            if item:FindFirstChild("GunMarker") then item.GunMarker:Destroy() end
+        end
+    end)
+
+    -- Buton Alanı
+    local btnBox = Instance.new("Frame", frame)
+    btnBox.Name = "Controls"
+    btnBox.Size = UDim2.new(1, -12, 0, 162)
+    btnBox.Position = UDim2.new(0, 6, 0, 42)
+    btnBox.BackgroundTransparency = 1
+
+    local lobbyBtn = Instance.new("TextButton", btnBox)
+    lobbyBtn.Size = UDim2.new(0.48, 0, 0, 26)
+    lobbyBtn.Position = UDim2.new(0, 0, 0, 0)
+    lobbyBtn.BackgroundColor3 = Color3.fromRGB(38, 42, 54)
+    lobbyBtn.Text = "Lobi TP"
+    lobbyBtn.TextColor3 = Color3.fromRGB(220, 225, 240)
+    lobbyBtn.Font = Enum.Font.GothamMedium
+    lobbyBtn.TextSize = 11
+    Instance.new("UICorner", lobbyBtn).CornerRadius = UDim.new(0, 4)
+
+    lobbyBtn.MouseButton1Click:Connect(function()
+        if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            player.Character.HumanoidRootPart.CFrame = CFrame.new(LOBBY_POS)
+        end
+    end)
+
+    local mapBtn = Instance.new("TextButton", btnBox)
+    mapBtn.Size = UDim2.new(0.48, 0, 0, 26)
+    mapBtn.Position = UDim2.new(0.52, 0, 0, 0)
+    mapBtn.BackgroundColor3 = Color3.fromRGB(38, 42, 54)
+    mapBtn.Text = "Map TP"
+    mapBtn.TextColor3 = Color3.fromRGB(220, 225, 240)
+    mapBtn.Font = Enum.Font.GothamMedium
+    mapBtn.TextSize = 11
+    Instance.new("UICorner", mapBtn).CornerRadius = UDim.new(0, 4)
+
+    mapBtn.MouseButton1Click:Connect(function()
+        if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            player.Character.HumanoidRootPart.CFrame = getHighestSurfaceCFrame(MAP_TARGET_POS)
+        end
+    end)
+
+    local farmBtn = Instance.new("TextButton", btnBox)
+    farmBtn.Size = UDim2.new(1, 0, 0, 26)
+    farmBtn.Position = UDim2.new(0, 0, 0, 32)
+    farmBtn.BackgroundColor3 = Color3.fromRGB(35, 38, 46)
+    farmBtn.Text = "Coin Farm: KAPALI"
+    farmBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
+    farmBtn.Font = Enum.Font.GothamBold
+    farmBtn.TextSize = 11
+    Instance.new("UICorner", farmBtn).CornerRadius = UDim.new(0, 4)
+
+    farmBtn.MouseButton1Click:Connect(function()
+        autoFarmActive = not autoFarmActive
+        if autoFarmActive then
+            farmBtn.Text = "Coin Farm: AÇIK"
+            farmBtn.TextColor3 = Color3.fromRGB(255, 215, 0)
+            farmBtn.BackgroundColor3 = Color3.fromRGB(48, 42, 20)
+        else
+            farmBtn.Text = "Coin Farm: KAPALI"
+            farmBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
+            farmBtn.BackgroundColor3 = Color3.fromRGB(35, 38, 46)
+        end
+    end)
+
+    -- Katil Eleme Butonu
+    local killAllBtn = Instance.new("TextButton", btnBox)
+    killAllBtn.Name = "KillAllBtn"
+    killAllBtn.Size = UDim2.new(1, 0, 0, 26)
+    killAllBtn.Position = UDim2.new(0, 0, 0, 64)
+    killAllBtn.BackgroundColor3 = Color3.fromRGB(45, 30, 30)
+    killAllBtn.Text = "⚡ Hepsini Ele (Katil Değilsin)"
+    killAllBtn.TextColor3 = Color3.fromRGB(160, 120, 120)
+    killAllBtn.Font = Enum.Font.GothamBold
+    killAllBtn.TextSize = 11
+    Instance.new("UICorner", killAllBtn).CornerRadius = UDim.new(0, 4)
+
+    local isEliminating = false
+    killAllBtn.MouseButton1Click:Connect(function()
+        if getRole(player) ~= "Katil" or isEliminating then return end
+        isEliminating = true
+        killAllBtn.Text = "Temizleniyor..."
+        killAllBtn.BackgroundColor3 = Color3.fromRGB(90, 20, 20)
+
+        pcall(function()
+            teleportAndEliminateAll(player)
+        end)
+
+        killAllBtn.Text = "⚡ Hepsini Ele (Katil Aktif)"
+        killAllBtn.BackgroundColor3 = Color3.fromRGB(180, 35, 35)
+        isEliminating = false
+    end)
+
+    -- Şerif Vurma Butonu
+    local shootKillerBtn = Instance.new("TextButton", btnBox)
+    shootKillerBtn.Name = "ShootKillerBtn"
+    shootKillerBtn.Size = UDim2.new(1, 0, 0, 26)
+    shootKillerBtn.Position = UDim2.new(0, 0, 0, 96)
+    shootKillerBtn.BackgroundColor3 = Color3.fromRGB(30, 35, 45)
+    shootKillerBtn.Text = "🎯 Katili Vur (Şerif Değilsin)"
+    shootKillerBtn.TextColor3 = Color3.fromRGB(120, 140, 170)
+    shootKillerBtn.Font = Enum.Font.GothamBold
+    shootKillerBtn.TextSize = 11
+    Instance.new("UICorner", shootKillerBtn).CornerRadius = UDim.new(0, 4)
+
+    local isShooting = false
+    shootKillerBtn.MouseButton1Click:Connect(function()
+        if getRole(player) ~= "Şerif" or isShooting then return end
+        isShooting = true
+        shootKillerBtn.Text = "Hedefe Gidiliyor..."
+        shootKillerBtn.BackgroundColor3 = Color3.fromRGB(20, 45, 80)
+
+        pcall(function()
+            teleportAndShootMurderer(player)
+        end)
+
+        shootKillerBtn.Text = "🎯 Katili Vur (Şerif Aktif)"
+        shootKillerBtn.BackgroundColor3 = Color3.fromRGB(35, 100, 200)
+        isShooting = false
+    end)
+
+    -- Düşen Silahı Al Butonu
+    local grabGunBtn = Instance.new("TextButton", btnBox)
+    grabGunBtn.Name = "GrabGunBtn"
+    grabGunBtn.Size = UDim2.new(1, 0, 0, 26)
+    grabGunBtn.Position = UDim2.new(0, 0, 0, 128)
+    grabGunBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 30)
+    grabGunBtn.Text = "🔫 Düşen Silahı Al (Silah Yok)"
+    grabGunBtn.TextColor3 = Color3.fromRGB(150, 150, 120)
+    grabGunBtn.Font = Enum.Font.GothamBold
+    grabGunBtn.TextSize = 11
+    Instance.new("UICorner", grabGunBtn).CornerRadius = UDim.new(0, 4)
+
+    local isGrabbing = false
+    grabGunBtn.MouseButton1Click:Connect(function()
+        if not getDroppedGunPart() or isGrabbing then return end
+        isGrabbing = true
+        grabGunBtn.Text = "Alınıyor..."
+
+        pcall(function()
+            teleportAndGrabGun(player)
+        end)
+
+        isGrabbing = false
+    end)
+
+    -- Oyuncu Listesi
+    local list = Instance.new("ScrollingFrame", frame)
+    list.Name = "RoleList"
+    list.Size = UDim2.new(1, -12, 1, -214)
+    list.Position = UDim2.new(0, 6, 0, 208)
+    list.BackgroundTransparency = 1
+    list.ScrollBarThickness = 2
+    list.CanvasSize = UDim2.new(0, 0, 0, 0)
+
+    local layout = Instance.new("UIListLayout", list)
+    layout.Padding = UDim.new(0, 4)
+end
+
+-- 10. Rolleri ve Buton Durumlarını Güncelleme
+local function refreshRoles()
+    if not isRunning then return end
+    local allPlayers = Players:GetPlayers()
+    local droppedGun = getDroppedGunPart()
+
+    for _, target in ipairs(allPlayers) do
+        local roleName, roleColor, badgeBg = getRole(target)
+        local char = target.Character
+
+        if char and char:FindFirstChild("Humanoid") and char.Humanoid.Health > 0 then
+            local highlight = char:FindFirstChild("RoleESP")
+            if not highlight then
+                highlight = Instance.new("Highlight")
+                highlight.Name = "RoleESP"
+                highlight.Adornee = char
+                highlight.Parent = char
+            end
+            highlight.FillColor = roleColor
+            highlight.FillTransparency = 0.35
+            highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+        end
+
+        for _, viewer in ipairs(allPlayers) do
+            local pGui = viewer:FindFirstChild("PlayerGui")
+            local panel = pGui and pGui:FindFirstChild("MM2ActionPanelGUI") and pGui.MM2ActionPanelGUI:FindFirstChild("Panel")
+
+            if panel then
+                if viewer == target then
+                    local killBtn = panel.Controls:FindFirstChild("KillAllBtn")
+                    local shootBtn = panel.Controls:FindFirstChild("ShootKillerBtn")
+                    local grabBtn = panel.Controls:FindFirstChild("GrabGunBtn")
+
+                    if killBtn then
+                        if roleName == "Katil" then
+                            killBtn.Text = "⚡ Hepsini Ele (Katil Aktif)"
+                            killBtn.BackgroundColor3 = Color3.fromRGB(180, 35, 35)
+                            killBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        else
+                            killBtn.Text = "⚡ Hepsini Ele (Katil Değilsin)"
+                            killBtn.BackgroundColor3 = Color3.fromRGB(45, 30, 30)
+                            killBtn.TextColor3 = Color3.fromRGB(160, 120, 120)
+                        end
+                    end
+
+                    if shootBtn then
+                        if roleName == "Şerif" then
+                            shootBtn.Text = "🎯 Katili Vur (Şerif Aktif)"
+                            shootBtn.BackgroundColor3 = Color3.fromRGB(35, 100, 200)
+                            shootBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        else
+                            shootBtn.Text = "🎯 Katili Vur (Şerif Değilsin)"
+                            shootBtn.BackgroundColor3 = Color3.fromRGB(30, 35, 45)
+                            shootBtn.TextColor3 = Color3.fromRGB(120, 140, 170)
+                        end
+                    end
+
+                    if grabBtn then
+                        if droppedGun then
+                            grabBtn.Text = "🔫 Düşen Silahı Al (TP & Dön)"
+                            grabBtn.BackgroundColor3 = Color3.fromRGB(200, 160, 20)
+                            grabBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        else
+                            grabBtn.Text = "🔫 Düşen Silahı Al (Silah Yok)"
+                            grabBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 30)
+                            grabBtn.TextColor3 = Color3.fromRGB(150, 150, 120)
+                        end
+                    end
+                end
+
+                local list = panel:FindFirstChild("RoleList")
+                if list then
+                    local card = list:FindFirstChild(target.Name)
+                    if not card then
+                        card = Instance.new("Frame", list)
+                        card.Name = target.Name
+                        card.Size = UDim2.new(1, 0, 0, 26)
+                        card.BackgroundColor3 = Color3.fromRGB(28, 30, 36)
+                        card.BorderSizePixel = 0
+                        Instance.new("UICorner", card).CornerRadius = UDim.new(0, 4)
+
+                        local nameLbl = Instance.new("TextLabel", card)
+                        nameLbl.Size = UDim2.new(0.6, 0, 1, 0)
+                        nameLbl.Position = UDim2.new(0, 6, 0, 0)
+                        nameLbl.BackgroundTransparency = 1
+                        nameLbl.Text = target.DisplayName
+                        nameLbl.TextColor3 = Color3.fromRGB(220, 220, 230)
+                        nameLbl.Font = Enum.Font.GothamMedium
+                        nameLbl.TextSize = 10
+                        nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+                        local badge = Instance.new("TextLabel", card)
+                        badge.Name = "Badge"
+                        badge.Size = UDim2.new(0.35, 0, 0, 18)
+                        badge.Position = UDim2.new(0.63, 0, 0.5, -9)
+                        badge.Font = Enum.Font.GothamBold
+                        badge.TextSize = 9
+                        Instance.new("UICorner", badge).CornerRadius = UDim.new(0, 3)
+                    end
+
+                    local badge = card:FindFirstChild("Badge")
+                    if badge then
+                        badge.Text = roleName
+                        badge.TextColor3 = roleColor
+                        badge.BackgroundColor3 = badgeBg
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- 11. Yere Düşen Silah Taraması (Sarı Parlama + 3D Tabela)
+local function scanDroppedGuns()
+    if not isRunning then return end
+    for _, item in ipairs(Workspace:GetChildren()) do
+        local lName = string.lower(item.Name)
+        if lName == "gundrop" or (item:IsA("Tool") and (lName == "gun" or lName == "revolver")) then
+            if not item:FindFirstChild("GunESP") then
+                local hl = Instance.new("Highlight", item)
+                hl.Name = "GunESP"
+                hl.FillColor = Color3.fromRGB(255, 215, 0)
+                hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                hl.FillTransparency = 0.2
+                hl.Adornee = item
+
+                local part = item:IsA("BasePart") and item or item:FindFirstChildWhichIsA("BasePart")
+                if part and not item:FindFirstChild("GunMarker") then
+                    local bg = Instance.new("BillboardGui", item)
+                    bg.Name = "GunMarker"
+                    bg.Adornee = part
+                    bg.Size = UDim2.new(0, 100, 0, 22)
+                    bg.StudsOffset = Vector3.new(0, 2.5, 0)
+                    bg.AlwaysOnTop = true
+
+                    local lbl = Instance.new("TextLabel", bg)
+                    lbl.Size = UDim2.new(1, 0, 1, 0)
+                    lbl.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+                    lbl.BackgroundTransparency = 0.2
+                    lbl.Text = "★ SİLAH ★"
+                    lbl.TextColor3 = Color3.fromRGB(255, 215, 0)
+                    lbl.Font = Enum.Font.GothamBold
+                    lbl.TextSize = 9
+                    Instance.new("UICorner", lbl).CornerRadius = UDim.new(0, 4)
+                end
+            end
+        end
+    end
+end
+
+-- 12. Otomatik Coin Toplayıcı
+local function runAutoFarm()
+    if not autoFarmActive or not isRunning then return end
+    local activeCoins = getActiveCoins()
+    if #activeCoins == 0 then return end
+
+    for _, coin in ipairs(activeCoins) do
+        if not autoFarmActive or not isRunning then break end
+        if coin and coin.Parent then
+            for _, player in ipairs(Players:GetPlayers()) do
+                if autoFarmActive and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+                    player.Character.HumanoidRootPart.CFrame = coin.CFrame
+                    task.wait(0.25)
+                end
+            end
+        end
+    end
+end
+
+-- 13. Dinleyiciler ve Başlatma
+local function bindEvents(player)
+    local function watch(container)
+        container.ChildAdded:Connect(function(child)
+            if child:IsA("Tool") then task.wait(0.1); refreshRoles() end
+        end)
+        container.ChildRemoved:Connect(function(child)
+            if child:IsA("Tool") then task.wait(0.1); refreshRoles() end
+        end)
+    end
+
+    player.CharacterAdded:Connect(function(char)
+        watch(char)
+        local backpack = player:WaitForChild("Backpack", 5)
+        if backpack then watch(backpack) end
+    end)
+
+    if player.Character then watch(player.Character) end
+    local backpack = player:FindFirstChild("Backpack")
+    if backpack then watch(backpack) end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    task.spawn(buildGui, p)
+    bindEvents(p)
+end
+
+Players.PlayerAdded:Connect(function(p)
+    buildGui(p)
+    bindEvents(p)
+end)
+
+task.spawn(function()
+    while isRunning do
+        pcall(refreshRoles)
+        pcall(scanDroppedGuns)
+        pcall(runAutoFarm)
+        task.wait(0.8)
+    end
+end)
